@@ -5,8 +5,10 @@ import time
 import pandas as pd
 import numpy as np
 import cv2
-H=640
-W=960
+from pipeline.filelist import Reader
+from layers.deformablelayer import DeformableConvLayer
+H=int(640/4)
+W=int(960/4)
 """
     This model comes from https://arxiv.org/pdf/1505.04597.pdf , if this is not the original paper then open an issue to say which one is.
 """
@@ -15,55 +17,35 @@ W=960
 
 #TODO :  put it in utils
 
-class Reader:
 
-    def __init__(self,path,batch_size=4,initial_step=0):
-        self.step=initial_step
-        self.reader=pd.read_csv(path,header=None,chunksize=batch_size)
+def IOU(y_pred, y_true):
+    """Returns a (approx) IOU score
 
-    def next_batch(self,h=H,w=W):
-        for chunk in self.reader:
-            return get_image_mask(chunk)
+    intesection = y_pred.flatten() * y_true.flatten()
+    Then, IOU = 2 * intersection / (y_pred.sum() + y_true.sum() + 1e-7) + 1e-7
 
+    Args:
+        y_pred (4-D array): (N, H, W, 1)
+        y_true (4-D array): (N, H, W, 1)
 
-def get_image_mask(frame_path,h=H,w=W):
-    """Returns `image` and `mask`
-
-    Input pipeline:
-        Queue -> CSV -> FileRead -> Decode JPEG
-
-    (1) Queue contains a CSV filename
-    (2) Text Reader opens the CSV
-        CSV file contains two columns
-        ["path/to/image.jpg", "path/to/mask.jpg"]
-    (3) File Reader opens both files
-    (4) Decode JPEG to tensors
-
-    Notes:
-        height, width = 640, 960
-
-    Returns
-        image (3-D Tensor): (640, 960, 3)
-        mask (3-D Tensor): (640, 960, 1)
+    Returns:
+        float: IOU score
     """
-    images_p=[]
-    masks_t=[]
-    for z in range(len(frame_path)):
-        i=cv2.imread(frame_path[0][z])
-        m=cv2.imread(frame_path[1][z],cv2.IMREAD_GRAYSCALE)
-        i=cv2.resize(i,(w,h))
-        m=cv2.resize(m,(w,h))
-        i=np.array(i,dtype=np.float32)
-        m=np.array(m,dtype=np.float32)
-        images_p+=[i]
-        masks_t+=[m]
-    masks_p=[ mask / (np.max(mask) + 1e-7) for mask in masks_t]
-    images=np.array(images_p)
-    masks=np.array(masks_p)
-    masks=np.expand_dims(masks,-1)
-    return images, masks
+    H, W, _ = y_pred.get_shape().as_list()[1:]
 
-def simpleConv2d(inputs : tf.Tensor,filters : (int)=8,kernel_size : Tuple[int,int]=(3,3),strides: (int)=2 ,padding : (str)="SAME",name : (str)="default_name",batch_norm : (bool)=True) -> tf.Tensor:
+    pred_flat = tf.reshape(y_pred, [-1, H * W])
+    true_flat = tf.reshape(y_true, [-1, H * W])
+
+    intersection = 2 * tf.reduce_sum(pred_flat * true_flat, axis=1) + 1e-7
+    denominator = tf.reduce_sum(
+        pred_flat, axis=1) + tf.reduce_sum(
+            true_flat, axis=1) + 1e-7
+
+    return tf.reduce_mean(intersection / denominator)
+
+
+
+def simpleConv2d(inputs : tf.Tensor,filters : (int)=8,kernel_size : Tuple[int,int]=(3,3),strides: (int)=2 ,padding : (str)="SAME",name : (str)="default_name",batch_norm : (bool)=True,deformable: (bool)=False,features : (bool)=False) -> tf.Tensor:
     """Wrapper to get batchnorm and activation inside
 
         Args:
@@ -78,18 +60,28 @@ def simpleConv2d(inputs : tf.Tensor,filters : (int)=8,kernel_size : Tuple[int,in
         Returns:
             Tensor depending of padding and kernel_size with filters numbers of channels.
     """
-    x = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, padding = padding,strides=strides,name=name+"_conv")(inputs)
+    if deformable:
+        x = DeformableConvLayer(filters = filters, kernel_size = kernel_size, padding = padding,strides=strides,name=name+"_conv")(inputs)
+    else:
+        x = tf.keras.layers.Conv2D(filters = filters, kernel_size = kernel_size, padding = padding,strides=strides,name=name+"_conv")(inputs)
     if batch_norm:
         x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation('relu')(x)
     
+    x = tf.keras.layers.Activation('relu')(x)
+    if features:
+        length=x.get_shape()[-1]
+        b=x.get_shape()[0]
+        h=x.get_shape()[1]
+        w=x.get_shape()[2]
+        for m in range(length):
+            tf.compat.v1.summary.image("Feature_"+name+"_{}".format(m),tf.compat.v1.image.resize(tf.reshape(x[:,:,:,m],[b,h,w,1]),(H,W)))
     return x
 
 # TODO : maybe need a mother class for all model to do argument parsing, etc...
 
 class UnetStruct():
 
-    def __init__(self,n_layer : int=3,n_filter : int=8,kernel_size : Tuple[int,int]=(3,3),batch_norm : bool=True,dropout : bool=False):
+    def __init__(self,n_layer : int=3,n_filter : int=8,kernel_size : Tuple[int,int]=(3,3),batch_norm : bool=True,dropout : bool=False,deformable : bool=True):
         """Initiate the UnetStruct Object.
 
         Args:
@@ -120,21 +112,21 @@ class UnetStruct():
         self.down_convs=[]
         for n in range(1,2*n_layer+1):
             if n%2==0:
-                self.down_convs+=[{"filters" : n_filter*2**(int(n/2)-1),"kernel_size":kernel_size,"strides": 2 ,"padding" : "SAME","name" : "down_{}".format(n),"batch_norm" : batch_norm}]
+                self.down_convs+=[{"filters" : n_filter*2**(int(n/2)-1),"kernel_size":kernel_size,"strides": 2 ,"padding" : "SAME","name" : "down_{}".format(n),"batch_norm" : batch_norm,"deformable":False}]
             else:
-                self.down_convs+=[{"filters" : n_filter*2**(int(n/2)),"kernel_size":kernel_size,"strides": 1,"padding" : "SAME","name" : "down_{}".format(n) ,"batch_norm" : batch_norm}]
+                self.down_convs+=[{"filters" : n_filter*2**(int(n/2)),"kernel_size":kernel_size,"strides": 1,"padding" : "SAME","name" : "down_{}".format(n) ,"batch_norm" : batch_norm,"deformable":False}]
 
         #middle
 
-        self.middle_conv = {"filters" : n_filter*2**(n_layer),"kernel_size":kernel_size,"strides": 1 ,"padding" : "SAME","name" : "middle","batch_norm" : batch_norm}
+        self.middle_conv = {"filters" : n_filter*2**(n_layer),"kernel_size":kernel_size,"strides": 1 ,"padding" : "SAME","name" : "middle","batch_norm" : batch_norm,"deformable":False,"features":True}
 
         #up way
         self.up_convs=[]
         for n in range(2*n_layer,0,-1):
             if n%2==0:
-                self.up_convs+=[{"filters" : n_filter*2**(int(n/2)-1),"kernel_size":kernel_size,"strides": 1 ,"padding" : "SAME","name" : "up_{}".format(n)}]
+                self.up_convs+=[{"filters" : n_filter*2**(int(n/2)-1),"kernel_size":kernel_size,"strides": 1 ,"padding" : "SAME","name" : "up_{}".format(n),"deformable":False}]
             else:
-                self.up_convs+=[{"filters" : n_filter*2**(int(n/2)),"kernel_size":kernel_size,"strides": 1,"padding" : "SAME","name" : "up_{}".format(n)}]
+                self.up_convs+=[{"filters" : n_filter*2**(int(n/2)),"kernel_size":kernel_size,"strides": 1,"padding" : "SAME","name" : "up_{}".format(n),"deformable":False}]
             
         self.n_filter=n_filter
         self.n_layer=n_layer
@@ -164,11 +156,14 @@ class UnetStruct():
             z=simpleConv2d(z,**x)
         
         z=simpleConv2d(z,1,strides=1,name="last")
+        z=tf.keras.layers.Activation('sigmoid')(z)
         self.y_pred=z
 
     def _createUnetLoss(self,y_true,loss : (str)="LSQ"):
         if loss=="LSQ":
             self.loss = tf.reduce_sum(tf.pow(tf.abs(self.y_pred-y_true),2))
+        elif loss=="IOU":
+            self.loss= -IOU(self.y_pred,y_true)
 
     def _createOptimizer(self,method,learning_rate=0.001):
         if method=="ADAM":
@@ -230,12 +225,12 @@ class UnetStruct():
 
         #Creation of model body
         tf.compat.v1.reset_default_graph()
-        X = tf.compat.v1.placeholder(tf.float32, shape=[None, heigth, width, channels_in], name="X")
-        Y = tf.compat.v1.placeholder(tf.float32, shape=[None, heigth, width, 1], name="y")
+        X = tf.compat.v1.placeholder(tf.float32, shape=[batch_size, heigth, width, channels_in], name="X")
+        Y = tf.compat.v1.placeholder(tf.float32, shape=[batch_size, heigth, width, 1], name="y")
         self._createBody(X)
 
         #Creation of train_op
-        self._createUnetLoss(Y)
+        self._createUnetLoss(Y,"IOU")
         self._createOptimizer("ADAM")
         self._createTrain()
 
@@ -243,21 +238,13 @@ class UnetStruct():
 
         tf.compat.v1.summary.image("Predicted", self.y_pred)
         tf.summary.scalar("Loss", self.loss)
-        tf.compat.v1.summary.image("True",X)
+        tf.compat.v1.summary.image("True",Y)
         summary_op = tf.compat.v1.summary.merge_all()
 
         #Batch setting
-        reader=Reader(train_path)
+        reader=Reader(train_path,custom_transformer=("Image",([H,H],[W,W],[3,1],["NO","AFF:0:1"])))
         
-        #train_csv=tf.data.Dataset.from_tensor_slices([train_path])
-        #train_image, train_mask = get_image_mask(train_csv,heigth,width)
-        #X_op, y_op = tf.train.batch(
-        #[train_image, train_mask],
-        #batch_size=4,
-        #capacity=4 * 2,
-        #allow_smaller_final_batch=True)
-        #train_csv = tf.train.string_input_producer(['train.csv'])
-        #test_csv = tf.train.string_input_producer(['test.csv'])
+        
         with tf.compat.v1.Session() as sess:
             train_summary_writer = tf.summary.FileWriter(train_logdir, sess.graph)
             #test_summary_writer = tf.summary.FileWriter(test_logdir)
@@ -265,37 +252,37 @@ class UnetStruct():
             init = tf.compat.v1.global_variables_initializer()
             sess.run(init)
             #Reload or Saving Setting
-            saver = tf.train.Saver()
-            if os.path.exists(ckdir) and tf.train.checkpoint_exists(ckdir):
-                latest_check_point = tf.train.latest_checkpoint(ckdir)
+            #saver = tf.train.Saver()
+            #if os.path.exists(ckdir) and tf.train.checkpoint_exists(ckdir):
+                #latest_check_point = tf.train.latest_checkpoint(ckdir)
                 #saver.restore(sess, latest_check_point)
-            else:
-                latest_check_point=None
-                try:
-                    os.rmdir(ckdir)
-                except FileNotFoundError:
-                    pass
-                os.mkdir(ckdir)
+            #else:
+                #latest_check_point=None
+                #try:
+                    #os.rmdir(ckdir)
+                #except FileNotFoundError:
+                    #pass
+                #os.mkdir(ckdir)
 
-            if latest_check_point is not None:
-                saver.restore(sess, latest_check_point)
-            try:
-                global_step = tf.train.get_global_step(sess.graph)
+            #if latest_check_point is not None:
+                #saver.restore(sess, latest_check_point)
+            
+            global_step = tf.train.get_global_step(sess.graph)
 
                 #coord = tf.train.Coordinator()
                 #threads = tf.train.start_queue_runners(coord=coord)
 
-                for epoch in range(epochs):
-                    for step in range(0,n_train,batch_size):
-                        a,b=reader.next_batch()
-                        print(a.shape)
-                        print(b.shape)
-                        _, step_loss, step_summary, global_step_value = sess.run([self.train_op,self.loss,summary_op,global_step],feed_dict={X: a,Y: b})
-                        train_summary_writer.add_summary(step_summary,global_step_value)
-                saver.save(sess, "{}/model.ckpt".format(ckdir))
+            for epoch in range(epochs):
+                for step in range(0,n_train,batch_size):
+                    a,b=reader.next_batch()
+                    print(a.shape)
+                    print(b.shape)
+                    _, step_loss, step_summary, global_step_value = sess.run([self.train_op,self.loss,summary_op,global_step],feed_dict={X: a,Y: b})
+                    train_summary_writer.add_summary(step_summary,global_step_value)
+                #saver.save(sess, "{}/model.ckpt".format(ckdir))
 
-            finally:
-                saver.save(sess, "{}/model.ckpt".format(ckdir))
+            
+                #saver.save(sess, "{}/model.ckpt".format(ckdir))
 
 
 
